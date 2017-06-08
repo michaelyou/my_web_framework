@@ -87,6 +87,17 @@ class BooleanField(Field):
         super(BooleanField, self).__init__(**kwargs)
 
 
+class TextField(Field):
+
+    def __init__(self, **kwargs):
+        if 'default' not in kwargs:
+            kwargs['default'] = False
+        if 'ddl' not in kwargs:
+            kwargs['ddl'] = 'text'
+
+        super(TextField, self).__init__(**kwargs)
+
+
 class ModelMetaClass(type):
 
     def __new__(cls, name, bases, attrs):
