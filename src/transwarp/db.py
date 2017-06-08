@@ -109,11 +109,9 @@ class _DbCtx(threading.local):
         self.transactions = 0
 
     def is_init(self):
-        print('check is init')
         return self.connection is not None
 
     def init(self):
-        print('do init')
         self.connection = _LasyConnection()
         self.transactions = 0
 
@@ -268,7 +266,9 @@ def update(sql, *args):
     return _update(sql, *args)
 
 
-def insert(sql, *args):
+def insert(table, **kwargs):
+    cols, args = zip(*kwargs.iteritems())
+    sql = 'insert into `%s` (%s) values (%s)' % (table, ','.join(['`%s`' % col for col in cols]), ','.join(['?' for i in range(len(cols))]))
     return _update(sql, *args)
 
 
