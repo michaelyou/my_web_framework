@@ -1,8 +1,12 @@
 # encoding=utf-8
 import re
+import types
 import urllib
 import cgi
 import datetime
+import logging
+import threading
+from wsgiref.simple_server import make_server
 
 import utils
 from db import Dict
@@ -118,6 +122,173 @@ _RE_RESPONSE_STATUS = re.compile(r'^\d\d\d(\ [\w\ ]+)?$')
 _HEADER_X_POWERED_BY = ('X-Powered-By', 'transwarp/1.0')
 _RE_TZ = re.compile('^([\+\-])([0-9]{1,2})\:([0-9]{1,2})$')
 _TIMEDELTA_ZERO = datetime.timedelta(0)
+ctx = threading.local()
+
+
+# 用于异常处理
+class _HttpError(Exception):
+
+    def __init__(self, code):
+        """
+        Init an HttpError with response code.
+        """
+        super(_HttpError, self).__init__()
+        self.status = '%d %s' % (code, _RESPONSE_STATUSES[code])
+        self._headers = None
+
+    def header(self, name, value):
+        """
+        添加header， 如果header为空则 添加powered by header
+        """
+        if not self._headers:
+            self._headers = [_HEADER_X_POWERED_BY]
+        self._headers.append((name, value))
+
+    @property
+    def headers(self):
+        """
+        使用setter方法实现的 header属性
+        """
+        if hasattr(self, '_headers'):
+            return self._headers
+        return []
+
+    def __str__(self):
+        return self.status
+
+    __repr__ = __str__
+
+
+class _RedirectError(_HttpError):
+
+    """
+    RedirectError that defines http redirect code.
+    >>> e = _RedirectError(302, 'http://www.apple.com/')
+    >>> e.status
+    '302 Found'
+    >>> e.location
+    'http://www.apple.com/'
+    """
+
+    def __init__(self, code, location):
+        """
+        Init an HttpError with response code.
+        """
+        super(_RedirectError, self).__init__(code)
+        self.location = location
+
+    def __str__(self):
+        return '%s, %s' % (self.status, self.location)
+
+    __repr__ = __str__
+
+
+class HttpError(object):
+
+    """
+    HTTP Exceptions
+    """
+    @staticmethod
+    def badrequest():
+        """
+        Send a bad request response.
+        >>> raise HttpError.badrequest()
+        Traceback (most recent call last):
+          ...
+        _HttpError: 400 Bad Request
+        """
+        return _HttpError(400)
+
+    @staticmethod
+    def unauthorized():
+        """
+        Send an unauthorized response.
+        >>> raise HttpError.unauthorized()
+        Traceback (most recent call last):
+          ...
+        _HttpError: 401 Unauthorized
+        """
+        return _HttpError(401)
+
+    @staticmethod
+    def forbidden():
+        """
+        Send a forbidden response.
+        >>> raise HttpError.forbidden()
+        Traceback (most recent call last):
+          ...
+        _HttpError: 403 Forbidden
+        """
+        return _HttpError(403)
+
+    @staticmethod
+    def notfound():
+        """
+        Send a not found response.
+        >>> raise HttpError.notfound()
+        Traceback (most recent call last):
+          ...
+        _HttpError: 404 Not Found
+        """
+        return _HttpError(404)
+
+    @staticmethod
+    def conflict():
+        """
+        Send a conflict response.
+        >>> raise HttpError.conflict()
+        Traceback (most recent call last):
+          ...
+        _HttpError: 409 Conflict
+        """
+        return _HttpError(409)
+
+    @staticmethod
+    def internalerror():
+        """
+        Send an internal error response.
+        >>> raise HttpError.internalerror()
+        Traceback (most recent call last):
+          ...
+        _HttpError: 500 Internal Server Error
+        """
+        return _HttpError(500)
+
+    @staticmethod
+    def redirect(location):
+        """
+        Do permanent redirect.
+        >>> raise HttpError.redirect('http://www.itranswarp.com/')
+        Traceback (most recent call last):
+          ...
+        _RedirectError: 301 Moved Permanently, http://www.itranswarp.com/
+        """
+        return _RedirectError(301, location)
+
+    @staticmethod
+    def found(location):
+        """
+        Do temporary redirect.
+        >>> raise HttpError.found('http://www.itranswarp.com/')
+        Traceback (most recent call last):
+          ...
+        _RedirectError: 302 Found, http://www.itranswarp.com/
+        """
+        return _RedirectError(302, location)
+
+    @staticmethod
+    def seeother(location):
+        """
+        Do temporary redirect.
+        >>> raise HttpError.seeother('http://www.itranswarp.com/')
+        Traceback (most recent call last):
+          ...
+        _RedirectError: 303 See Other, http://www.itranswarp.com/
+        >>> e = HttpError.seeother('http://www.itranswarp.com/seeother?r=123')
+        >>> e.location
+        'http://www.itranswarp.com/seeother?r=123'
+        """
+        return _RedirectError(303, location)
 
 
 class UTC(datetime.tzinfo):
@@ -476,21 +647,182 @@ class Route(object):
     __repr__ = __str__
 
 
+def _build_interceptor_fn(func, next):
+    """
+    拦截器接受一个next函数，这样，一个拦截器可以决定调用next()继续处理请求还是直接返回
+    """
+
+    def _wrapper():
+        if func.__interceptor__(ctx.request.path_info):
+            return func(next)
+        else:
+            return next()
+    return _wrapper
+
+
+def _build_interceptor_chain(last_fn, *interceptors):
+    """
+    Build interceptor chain.
+    >>> def target():
+    ...     print 'target'
+    ...     return 123
+    >>> @interceptor('/')
+    ... def f1(next):
+    ...     print 'before f1()'
+    ...     return next()
+    >>> @interceptor('/test/')
+    ... def f2(next):
+    ...     print 'before f2()'
+    ...     try:
+    ...         return next()
+    ...     finally:
+    ...         print 'after f2()'
+    >>> @interceptor('/')
+    ... def f3(next):
+    ...     print 'before f3()'
+    ...     try:
+    ...         return next()
+    ...     finally:
+    ...         print 'after f3()'
+    >>> chain = _build_interceptor_chain(target, f1, f2, f3)
+    >>> ctx.request = Dict(path_info='/test/abc')
+    >>> chain()
+    before f1()
+    before f2()
+    before f3()
+    target
+    after f3()
+    after f2()
+    123
+    >>> ctx.request = Dict(path_info='/api/')
+    >>> chain()
+    before f1()
+    before f3()
+    target
+    after f3()
+    123
+    """
+    L = list(interceptors)
+    L.reverse()
+    fn = last_fn
+    for f in L:
+        fn = _build_interceptor_fn(f, fn)
+    return fn
+
+
+def _load_module(module_name):
+    last_dot = module_name.rfind('.')
+    # not found
+    if last_dot == -1:
+        return __import__(module_name, globals(), locals())
+    from_module = module_name[:last_dot]
+    import_module = module_name[last_dot+1:]
+    m = __import__(from_module, globals(), locals(), [import_module])
+    return getattr(m, import_module)
+
+
 class WSGIApplication(object):
 
     def __init__(self, document_root=None, **kwargs):
         self._running = False
         self._document_root = document_root
 
+        self._get_static = {}
+        self._post_static = {}
+
+        self._get_dynamic = []
+        self._post_dynamic = []
+
     def _check_not_running(self):
         if self._running:
             raise RuntimeError('Cannot modify WSGIApplication when running.')
+
+    def add_module(self, module):
+        self._check_not_running()
+        m = module if isinstance(module, types.ModuleType) else _load_module(module)
+        logging.info('Add module: %s' % m.__name__)
+        for name in dir(m):
+            fn = getattr(m, name)
+            if callable(fn) and hasattr(fn, '__web_route__') and hasattr(fn, '__web_method__'):
+                self.add_url(fn)
+
+    def add_url(self, func):
+        self._check_not_running()
+        route = Route(func)
+        if route.is_static:
+            if route.method == 'GET':
+                self._get_static[route.path] = route
+            elif route.method == 'POST':
+                self._post_static[route.path] = route
+        else:
+            if route.method == 'GET':
+                self._get_dynamic.append(route)
+            elif route.method == 'POST':
+                self._post_dynamic.append(route)
+        logging.info('Add route: %s' % str(route))
 
     def run(self, port=9000, host='127.0.0.1'):
         """
         启动python自带的WSGI Server
         """
-        from wsgiref.simple_server import make_server
         logging.info('application (%s) will start at %s:%s...' % (self._document_root, host, port))
         server = make_server(host, port, self.get_wsgi_application(debug=True))
         server.serve_forever()
+
+    def get_wsgi_application(self, debug=False):
+        self._check_not_running()
+        # if debug:
+        #     self._get_dynamic.append(StaticFileRoute())
+        self._running = True
+
+        _application = Dict(document_root=self._document_root)
+
+        def fn_route():
+            request_method = ctx.request.request_method
+            path_info = ctx.request.path_info
+            if request_method == 'GET':
+                fn = self._get_static.get(path_info)
+                if fn:
+                    return fn()
+                for fn in self._get_dynamic:
+                    args = fn.match(path_info)
+                    if args:
+                        return fn(*args)
+                raise HttpError.notfound()
+            if request_method == 'POST':
+                fn = self._post_static.get(path_info)
+                if fn:
+                    return fn()
+                for fn in self._post_dynamic:
+                    args = fn.match(path_info)
+                    if args:
+                        return fn(*args)
+                raise HttpError.notfound()
+
+        fn_exec = _build_interceptor_chain(fn_route, *self._interceptors)
+
+        def wsgi(env, start_response):
+            # WSGI 处理函数
+            ctx.application = _application
+            ctx.request = Request(env)
+            response = ctx.response = Response()
+            try:
+                r = fn_exec()
+                if isinstance(r, unicode):
+                    r = r.encode('utf-8')
+                if r is None:
+                    r = []
+                start_response(response.status, response.headers)
+                return r
+            except _RedirectError, e:
+                response.set_header('Location', e.location)
+                start_response(e.status, response.headers)
+                return []
+            except Exception as e:
+                return []
+            finally:
+                del ctx.application
+                del ctx.request
+                del ctx.response
+
+        return wsgi
