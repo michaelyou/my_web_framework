@@ -622,7 +622,7 @@ def _build_regex(path):
 class Route(object):
 
     def __init__(self, func):
-        self.path = func.__web_method__
+        self.path = func.__web_route__
         self.method = func.__web_method__
         self.is_static = _re_route.search(self.path) is None
         if not self.is_static:
@@ -727,6 +727,8 @@ class WSGIApplication(object):
         self._running = False
         self._document_root = document_root
 
+        self._interceptors = []
+
         self._get_static = {}
         self._post_static = {}
 
@@ -744,6 +746,7 @@ class WSGIApplication(object):
         for name in dir(m):
             fn = getattr(m, name)
             if callable(fn) and hasattr(fn, '__web_route__') and hasattr(fn, '__web_method__'):
+                print('add url for', fn)
                 self.add_url(fn)
 
     def add_url(self, func):
@@ -751,6 +754,7 @@ class WSGIApplication(object):
         route = Route(func)
         if route.is_static:
             if route.method == 'GET':
+                print('a get route', route.path)
                 self._get_static[route.path] = route
             elif route.method == 'POST':
                 self._post_static[route.path] = route
@@ -778,9 +782,11 @@ class WSGIApplication(object):
         _application = Dict(document_root=self._document_root)
 
         def fn_route():
+            print('enter fn router')
             request_method = ctx.request.request_method
             path_info = ctx.request.path_info
             if request_method == 'GET':
+                print('static urls', self._get_static)
                 fn = self._get_static.get(path_info)
                 if fn:
                     return fn()
@@ -806,19 +812,23 @@ class WSGIApplication(object):
             ctx.application = _application
             ctx.request = Request(env)
             response = ctx.response = Response()
+            print('begin to handle')
             try:
                 r = fn_exec()
                 if isinstance(r, unicode):
+                    print('encode')
                     r = r.encode('utf-8')
                 if r is None:
                     r = []
                 start_response(response.status, response.headers)
+                print('my response', r)
                 return r
             except _RedirectError, e:
                 response.set_header('Location', e.location)
                 start_response(e.status, response.headers)
                 return []
             except Exception as e:
+                print('get error', e)
                 return []
             finally:
                 del ctx.application
