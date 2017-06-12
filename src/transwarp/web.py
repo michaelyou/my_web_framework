@@ -183,6 +183,17 @@ class _RedirectError(_HttpError):
     __repr__ = __str__
 
 
+class _URLNotFoundError(_HttpError):
+
+    def __init__(self, code=404):
+        super(_URLNotFoundError, self).__init__(code)
+
+    def __str__(self):
+        return 'url not found'
+
+    __repr__ = __str__
+
+
 class HttpError(object):
 
     """
@@ -352,8 +363,10 @@ class Request(object):
                 return [utils.to_unicode(i.value) for i in item]
             if item.filename:
                 return MultipartFile(item)
-            return utils.to_unicode(item.value)
+            # return utils.to_unicode(item.value)
+            return item.value
 
+        print('environ', self._environ)
         fs = cgi.FieldStorage(fp=self._environ['wsgi.input'], environ=self._environ, keep_blank_values=True)
         inputs = dict()
         for key in fs:
@@ -373,6 +386,7 @@ class Request(object):
         return r
 
     def get(self, key):
+        print('after parse', self._get_raw_input())
         r = self._get_raw_input()[key]
         if isinstance(r, list):
             return r[0]
@@ -746,7 +760,6 @@ class WSGIApplication(object):
         for name in dir(m):
             fn = getattr(m, name)
             if callable(fn) and hasattr(fn, '__web_route__') and hasattr(fn, '__web_method__'):
-                print('add url for', fn)
                 self.add_url(fn)
 
     def add_url(self, func):
@@ -754,7 +767,6 @@ class WSGIApplication(object):
         route = Route(func)
         if route.is_static:
             if route.method == 'GET':
-                print('a get route', route.path)
                 self._get_static[route.path] = route
             elif route.method == 'POST':
                 self._post_static[route.path] = route
@@ -779,14 +791,13 @@ class WSGIApplication(object):
         #     self._get_dynamic.append(StaticFileRoute())
         self._running = True
 
+        # {'document_root': '/Users/**/code/my_web_framework/src'}
         _application = Dict(document_root=self._document_root)
 
         def fn_route():
-            print('enter fn router')
             request_method = ctx.request.request_method
             path_info = ctx.request.path_info
             if request_method == 'GET':
-                print('static urls', self._get_static)
                 fn = self._get_static.get(path_info)
                 if fn:
                     return fn()
@@ -794,7 +805,7 @@ class WSGIApplication(object):
                     args = fn.match(path_info)
                     if args:
                         return fn(*args)
-                raise HttpError.notfound()
+                raise _URLNotFoundError
             if request_method == 'POST':
                 fn = self._post_static.get(path_info)
                 if fn:
@@ -803,7 +814,7 @@ class WSGIApplication(object):
                     args = fn.match(path_info)
                     if args:
                         return fn(*args)
-                raise HttpError.notfound()
+                raise _URLNotFoundError
 
         fn_exec = _build_interceptor_chain(fn_route, *self._interceptors)
 
@@ -812,23 +823,22 @@ class WSGIApplication(object):
             ctx.application = _application
             ctx.request = Request(env)
             response = ctx.response = Response()
-            print('begin to handle')
             try:
                 r = fn_exec()
                 if isinstance(r, unicode):
-                    print('encode')
                     r = r.encode('utf-8')
                 if r is None:
                     r = []
                 start_response(response.status, response.headers)
-                print('my response', r)
                 return r
             except _RedirectError, e:
                 response.set_header('Location', e.location)
                 start_response(e.status, response.headers)
                 return []
+            except _URLNotFoundError as e:
+                start_response(e.status, response.headers)
+                return []
             except Exception as e:
-                print('get error', e)
                 return []
             finally:
                 del ctx.application
